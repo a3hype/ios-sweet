@@ -1,0 +1,16 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -200,6 +200,13 @@ touch_clocks(void)
+ 	const uint32_t a70_branches[] = {0x17004, 0x17008, 0x1700c, 0x17014, 0x17274};
+ 	const uint32_t *branches = touch_a70 ? a70_branches : sweet_branches;
+ 	for (unsigned i = 0; i < 5; ++i) {
++		/* A70: wrap0 s_ahb (0x17008) is hardware clock gated (HW_CTL, bit 1); Linux's clk_branch skips the halt
++		 * check in HWCG mode because CLK_OFF reads 1 while idle. Same here, A70 path only. */
++		if (touch_a70 && (touch_rd(st.gcc, branches[i]) & 2u)) {
++			printf("SWEET TOUCH: GCC branch %#x hwcg (%#x), halt check skipped\n", branches[i],
++			    touch_rd(st.gcc, branches[i]));
++			continue;
++		}
+ 		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
+ 			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
+ 			    touch_rd(st.gcc, branches[i]));
