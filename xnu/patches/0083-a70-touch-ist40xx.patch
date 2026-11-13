@@ -1,0 +1,314 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -81,6 +81,41 @@ static struct {
+ } st;
+ static int touch_sleep_chan;
+ 
++/*
++ * A70 (Samsung SM-A705FN, a70q, SM6150), selected with boot-arg sweettouchhw=a70.
++ * Live FDT: i2c@884000 (QUP0 SE1, pins gpio4/gpio5 function qup01) holds imagis,ist40xx-ts at 0x50,
++ * irq gpio89 (input, no bias, falling edge in Linux), AVDD pm6150_l18 = 3.0 V fixed and regulator-boot-on,
++ * no reset GPIO. GCC (gcc-sm6150.c): vote 0x5200c bits 6..9 (wrap0 m_ahb, s_ahb, core, core_2x) and 11 (s1),
++ * branch halts 0x17004/0x17008/0x1700c/0x17014/0x17274, s1 RCG 0x17278. TLMM WEST tile 0x3000000 + 0x500000.
++ * IST40xx protocol (Samsung ist40xx_sys.c/ist40xx.c): 4-byte big-endian address, 32-bit big-endian data words.
++ * Writes on the A70 path: GCC votes/RCG (as sweet), TLMM config of gpio4/5/89 only, GENI SE1 setup,
++ * and three IST registers: I2C 32-bit mode, HIB command "notify regmap", HIB command "FW start" (start scan).
++ * No firmware upload, no PMIC/RPMh writes, and sweet's gpio8/gpio90 are never touched.
++ */
++#define A70_SE_PA          0x00884000u
++#define A70_WEST_PA        0x03500000u
++#define A70_GCC_VOTE_MASK  ((0x0fu << 6) | (1u << 11))
++#define A70_RCG            0x17278u
++#define A70_PIN_SDA        4u
++#define A70_PIN_SCL        5u
++#define A70_PIN_IRQ        89u
++#define A70_W              1080
++#define A70_H              2400
++#define IST_ADDR           0x50u
++#define IST_I2C_CTRL       0xb0000000u /* DA(0x30000000) */
++#define IST_I2C_32BIT      0x003912d8u
++#define IST_CHIPID         0xc0001000u /* DA(0x40001000) */
++#define IST_HIB_INTR_MSG   0xb00b0104u /* HA(0x30000104) */
++#define IST_HIB_COORD_BA   0xb80b0108u /* BA(HA(0x30000108)) */
++#define IST_HIB_CMD        0xb00b015cu /* HA(0x3000015c) */
++#define IST_CMD_REGMAP     ((0x50u << 16) | 1u)
++#define IST_CMD_FW_START   ((0x01u << 16) | 1u)
++#define IST_MSG_INITIAL    0x8ead8eadu
++#define IST_MSG_REC        0x8ca0d00eu
++#define IST_MAX_FINGERS    15u
++static bool touch_a70;
++static uint32_t ist_last_msg, ist_last_coord[2 * IST_MAX_FINGERS];
++
+ static uint32_t
+ touch_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -137,15 +172,16 @@ static bool
+ touch_clocks(void)
+ {
+ 	/* Vote on only wrapper1 and SE7, preserving other clock users. */
+-	uint32_t mask = (0x0fu << 18) | (1u << 23);
++	uint32_t mask = touch_a70 ? A70_GCC_VOTE_MASK : ((0x0fu << 18) | (1u << 23));
++	const uint32_t rcg = touch_a70 ? A70_RCG : TOUCH_RCG;
+ 	touch_wr(st.gcc, TOUCH_GCC_VOTE, touch_rd(st.gcc, TOUCH_GCC_VOTE) | mask);
+-	uint32_t dfs = touch_rd(st.gcc, TOUCH_RCG + 0x14u);
+-	uint32_t cfg = touch_rd(st.gcc, TOUCH_RCG + 4u);
++	uint32_t dfs = touch_rd(st.gcc, rcg + 0x14u);
++	uint32_t cfg = touch_rd(st.gcc, rcg + 4u);
+ 	printf("SWEET TOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
+-	    touch_rd(st.gcc, TOUCH_GCC_VOTE), touch_rd(st.gcc, TOUCH_RCG), cfg, dfs);
++	    touch_rd(st.gcc, TOUCH_GCC_VOTE), touch_rd(st.gcc, rcg), cfg, dfs);
+ 	if (dfs & 1u) {
+ 		/* SE CLK_SEL=0 selects DFS performance level 0. Do not alter tables. */
+-		cfg = touch_rd(st.gcc, TOUCH_RCG + 0x1cu);
++		cfg = touch_rd(st.gcc, rcg + 0x1cu);
+ 		if ((cfg & 0x371fu) != 1u) {
+ 			printf("SWEET TOUCH: DFS level0=%#x is not XO/1; need clock integration\n", cfg);
+ 			return false;
+@@ -153,15 +189,17 @@ touch_clocks(void)
+ 	} else {
+ 		/* XO parent 0, HID divider 1 => 19.2 MHz. No PLL or voltage change. */
+ 		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
+-		touch_wr(st.gcc, TOUCH_RCG + 4u, cfg);
+-		touch_wr(st.gcc, TOUCH_RCG, touch_rd(st.gcc, TOUCH_RCG) | 1u);
+-		if (!touch_wait_clear(st.gcc, TOUCH_RCG, 1u)) {
++		touch_wr(st.gcc, rcg + 4u, cfg);
++		touch_wr(st.gcc, rcg, touch_rd(st.gcc, rcg) | 1u);
++		if (!touch_wait_clear(st.gcc, rcg, 1u)) {
+ 			printf("SWEET TOUCH: RCG update timeout\n");
+ 			return false;
+ 		}
+ 	}
+-	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, 0x18144};
+-	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++	const uint32_t sweet_branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, 0x18144};
++	const uint32_t a70_branches[] = {0x17004, 0x17008, 0x1700c, 0x17014, 0x17274};
++	const uint32_t *branches = touch_a70 ? a70_branches : sweet_branches;
++	for (unsigned i = 0; i < 5; ++i) {
+ 		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
+ 			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
+ 			    touch_rd(st.gcc, branches[i]));
+@@ -209,12 +247,12 @@ touch_irq(void)
+ 	return st.irq_last;
+ }
+ 
+-/* One Linux-style FIFO message. TX is at most 3 bytes; RX at most 90. */
++/* One Linux-style FIFO message. TX is at most 8 bytes (2 FIFO words); RX at most 128. */
+ static int
+ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+     unsigned nr, bool stretch)
+ {
+-	if (st.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
++	if (st.dead || nt > 8 || nr > 128 || (nt && nr) || (!nt && !nr)) {
+ 		return EIO;
+ 	}
+ 	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
+@@ -247,11 +285,13 @@ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+ 			break;
+ 		}
+ 		if (nt && !st.sent && (irq & SE_TX_WM_IRQ)) {
+-			uint32_t word = 0;
+-			for (unsigned j = 0; j < nt; ++j) {
+-				word |= (uint32_t)tx[j] << (8u * j);
++			for (unsigned w = 0; w < nt; w += 4) {
++				uint32_t word = 0;
++				for (unsigned j = 0; j < 4 && w + j < nt; ++j) {
++					word |= (uint32_t)tx[w + j] << (8u * j);
++				}
++				touch_wr(st.se, SE_TX, word);
+ 			}
+-			touch_wr(st.se, SE_TX, word);
+ 			st.sent = nt;
+ 			touch_wr(st.se, SE_TX_WM, 0);
+ 		}
+@@ -383,6 +423,156 @@ touch_report(uint32_t mask, const int *x, const int *y)
+ 	st.active = mask;
+ }
+ 
++static uint32_t
++ist_be32(const uint8_t *b)
++{
++	return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3];
++}
++
++/* IST40xx read: 4-byte big-endian address (STOP_STRETCH, repeated START), then n big-endian words. */
++static int
++ist_read(uint32_t reg, uint32_t *out, unsigned n)
++{
++	uint8_t a[4] = {(uint8_t)(reg >> 24), (uint8_t)(reg >> 16), (uint8_t)(reg >> 8), (uint8_t)reg};
++	uint8_t buf[128];
++	if (n == 0 || n > 32) {
++		return EINVAL;
++	}
++	int err = touch_msg(IST_ADDR, a, 4, NULL, 0, true);
++	if (!err) {
++		err = touch_msg(IST_ADDR, NULL, 0, buf, n * 4u, false);
++	}
++	for (unsigned i = 0; !err && i < n; ++i) {
++		out[i] = ist_be32(buf + 4u * i);
++	}
++	return err;
++}
++
++/* IST40xx write: address and value, both big-endian, in one 8-byte message. */
++static int
++ist_write(uint32_t reg, uint32_t val)
++{
++	uint8_t b[8] = {(uint8_t)(reg >> 24), (uint8_t)(reg >> 16), (uint8_t)(reg >> 8), (uint8_t)reg,
++		(uint8_t)(val >> 24), (uint8_t)(val >> 16), (uint8_t)(val >> 8), (uint8_t)val};
++	return touch_msg(IST_ADDR, b, 8, NULL, 0, false);
++}
++
++/*
++ * One IST40xx report (Samsung ist40xx_irq_thread): HIB_INTR_MSG bit 11 = touch status, bits 12..15 = record count;
++ * then 2 words per record from HIB_COORD: y[11:0] x[23:12] status[27:24] id[31:28] (1-based); status 1 press,
++ * 2 release, 0/3 ignored. Polled every 10 ms; an unchanged message+records pair is not reported again.
++ */
++static int
++touch_ist(void)
++{
++	uint32_t msg = 0, coord[2 * IST_MAX_FINGERS];
++	int err = ist_read(IST_HIB_INTR_MSG, &msg, 1);
++	if (err) {
++		return err;
++	}
++	if (msg == 0 || msg == 0xffffffffu || msg == IST_MSG_INITIAL || msg == IST_MSG_REC ||
++	    (msg & 0xffffff00u) == 0xe11ce900u || !(msg & 0x800u)) {
++		if (msg != ist_last_msg && msg != 0) {
++			printf("SWEET TOUCH: ist msg %#x (not a touch report)\n", msg);
++		}
++		ist_last_msg = msg;
++		return 0;
++	}
++	unsigned cnt = (msg >> 12) & 0xfu;
++	if (cnt == 0 || cnt > IST_MAX_FINGERS) {
++		ist_last_msg = msg;
++		return 0;
++	}
++	err = ist_read(IST_HIB_COORD_BA, coord, 2u * cnt);
++	if (err) {
++		return err;
++	}
++	if (msg == ist_last_msg) {
++		bool same = true;
++		for (unsigned i = 0; i < 2u * cnt; ++i) {
++			same = same && coord[i] == ist_last_coord[i];
++		}
++		if (same) {
++			return 0;
++		}
++	}
++	ist_last_msg = msg;
++	for (unsigned i = 0; i < 2u * cnt; ++i) {
++		ist_last_coord[i] = coord[i];
++	}
++	uint32_t mask = st.active;
++	int x[TOUCH_MAX], y[TOUCH_MAX];
++	for (unsigned id = 0; id < TOUCH_MAX; ++id) {
++		x[id] = st.x[id];
++		y[id] = st.y[id];
++	}
++	for (unsigned i = 0; i < cnt; ++i) {
++		uint32_t w = coord[2u * i];
++		unsigned status = (w >> 24) & 0xfu, id = (w >> 28) & 0xfu;
++		int fy = (int)(w & 0xfffu), fx = (int)((w >> 12) & 0xfffu);
++		if (id == 0 || id > TOUCH_MAX) {
++			continue;
++		}
++		id -= 1;
++		if (status == 1u && fx < A70_W && fy < A70_H) {
++			mask |= 1u << id;
++			x[id] = fx;
++			y[id] = fy;
++		} else if (status == 2u) {
++			mask &= ~(1u << id);
++		}
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
++/* A70 bring-up: pins, IST40xx 32-bit I2C mode, chip id, start scan; then poll. */
++static void
++touch_a70_run(void)
++{
++	printf("SWEET TOUCH: a70 TLMM sda=%#x scl=%#x irq=%#x (cfg %#x/%#x/%#x)\n",
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(A70_PIN_SDA)), touch_rd(st.gpio, TOUCH_GPIO_IO(A70_PIN_SCL)),
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(A70_PIN_IRQ)), touch_rd(st.gpio, TOUCH_GPIO_CFG(A70_PIN_SDA)),
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(A70_PIN_SCL)), touch_rd(st.gpio, TOUCH_GPIO_CFG(A70_PIN_IRQ)));
++	touch_gpio(A70_PIN_IRQ, 0, 0, 0, false, false); /* gpio, input, bias-disable */
++	touch_gpio(A70_PIN_SDA, 1, 0, 0, false, false); /* qup01, bias-disable, 2 mA */
++	touch_gpio(A70_PIN_SCL, 1, 0, 0, false, false);
++	touch_wait(10);
++	uint32_t chip = 0;
++	st.probing = true;
++	int e1 = ist_write(IST_I2C_CTRL, IST_I2C_32BIT);
++	touch_wait(2);
++	int e2 = ist_read(IST_CHIPID, &chip, 1);
++	st.probing = false;
++	printf("SWEET TOUCH: ist40xx 32bit err=%d chipid err=%d value=%#x irq=%#x\n",
++	    e1, e2, chip, st.irq_status);
++	if (st.dead || e2 || ((chip >> 16) != 0x4070u && (chip >> 16) != 0x4050u && (chip & 0xffffu) != 0x4070u &&
++	    (chip & 0xffffu) != 0x4050u)) {
++		printf("SWEET TOUCH: ist40xx not confirmed (dead=%d); stopping, no rail vote\n", st.dead);
++		return;
++	}
++	int e3 = ist_write(IST_HIB_CMD, IST_CMD_REGMAP);
++	int e4 = ist_write(IST_HIB_CMD, IST_CMD_FW_START);
++	printf("SWEET TOUCH: ist40xx regmap err=%d start err=%d; polling every 10 ms, %ux%u\n",
++	    e3, e4, A70_W, A70_H);
++	unsigned errors = 0;
++	while (!st.dead) {
++		int err = touch_ist();
++		if (err) {
++			if ((errors++ % 100u) == 0) {
++				printf("SWEET TOUCH: ist report err=%d irq=%#x\n", err, st.irq_status);
++			}
++			if (errors == 10) {
++				touch_report(0, st.x, st.y);
++			}
++		} else {
++			errors = 0;
++		}
++		touch_wait(10);
++	}
++	touch_report(0, st.x, st.y);
++}
++
+ static int
+ touch_goodix(void)
+ {
+@@ -558,10 +748,10 @@ touch_thread(void *arg, wait_result_t result)
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
+ 	printf("SWEET TOUCH: starting in %u s\n", delay_s);
+ 	touch_wait(delay_s * 1000u);
+-	printf("SWEET TOUCH: mapping GCC/TLMM/SE7\n");
++	printf("SWEET TOUCH: mapping GCC/TLMM/SE (%s)\n", touch_a70 ? "a70: QUP0 SE1, TLMM west" : "sweet: SE7");
+ 	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+-	st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
+-	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
++	st.gpio = ml_io_map(touch_a70 ? A70_WEST_PA : TOUCH_NORTH_PA, touch_a70 ? 0x5a000 : 0x5b000);
++	st.se = ml_io_map(touch_a70 ? A70_SE_PA : TOUCH_SE_PA, 0x4000);
+ 	if (!st.gcc || !st.gpio || !st.se) {
+ 		printf("SWEET TOUCH: MMIO mapping failed\n");
+ 		goto out;
+@@ -569,6 +759,10 @@ touch_thread(void *arg, wait_result_t result)
+ 	if (!touch_clocks() || !touch_se_init()) {
+ 		goto out;
+ 	}
++	if (touch_a70) {
++		touch_a70_run();
++		goto out;
++	}
+ 	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
+@@ -646,6 +840,9 @@ sweet_touch_init(void)
+ 	st.started = true;
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
++	char hw[16] = "";
++	(void)PE_parse_boot_argn("sweettouchhw", hw, sizeof(hw));
++	touch_a70 = hw[0] == 'a' && hw[1] == '7' && hw[2] == '0' && hw[3] == 0;
+ 	if (!enabled) {
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+ 		return;
